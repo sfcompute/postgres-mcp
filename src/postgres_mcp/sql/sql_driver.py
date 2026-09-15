@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,42 @@ from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer from the environment, falling back to `default` on missing or invalid values."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"Invalid value {value!r} for {name}; using default {default}")
+        return default
+
+
+# Caps on the result set a single query may return, enforced while fetching so
+# an oversized result cannot be materialized in this process's memory at all.
+# Values <= 0 disable the corresponding cap.
+MAX_RESULT_ROWS = _env_int("POSTGRES_MCP_MAX_RESULT_ROWS", 5000)
+MAX_RESULT_BYTES = _env_int("POSTGRES_MCP_MAX_RESULT_BYTES", 5 * 1024 * 1024)
+
+# Server-side statement timeout applied to read-only queries, so a pathological
+# query is also canceled on the database server rather than only abandoned
+# client-side. <= 0 disables it.
+STATEMENT_TIMEOUT_SECONDS = _env_int("POSTGRES_MCP_STATEMENT_TIMEOUT_SECONDS", 30)
+
+FETCH_BATCH_SIZE = 500
+
+
+@dataclass
+class ResultTruncation:
+    """Details of a result set cut off by MAX_RESULT_ROWS / MAX_RESULT_BYTES."""
+
+    rows_returned: int
+    bytes_returned: int
+    max_rows: int
+    max_bytes: int
 
 
 def _invalidates_pool(e: BaseException) -> bool:
@@ -179,6 +216,9 @@ class SqlDriver:
 
         cells: Dict[str, Any]
 
+    # Set when the most recent execute_query() hit a result-set cap.
+    last_truncation: Optional[ResultTruncation] = None
+
     def __init__(
         self,
         conn: Any = None,
@@ -228,8 +268,11 @@ class SqlDriver:
             force_readonly: Whether to enforce read-only mode
 
         Returns:
-            List of RowResult objects or None on error
+            List of RowResult objects or None on error. If the result set hit
+            a cap, the returned rows are the prefix that fit and
+            `self.last_truncation` describes the truncation.
         """
+        self.last_truncation = None
         try:
             if self.conn is None:
                 self.connect()
@@ -269,6 +312,16 @@ class SqlDriver:
                 if force_readonly:
                     await cursor.execute("BEGIN TRANSACTION READ ONLY")
                     transaction_started = True
+                    if STATEMENT_TIMEOUT_SECONDS > 0:
+                        # Cancel long queries on the server too: a client-side
+                        # timeout (SafeSqlDriver's asyncio.timeout) only stops
+                        # waiting and leaves the query running on the database.
+                        # set_config(..., is_local=true) scopes it to this
+                        # transaction, so pooled connections are not affected.
+                        await cursor.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            [f"{STATEMENT_TIMEOUT_SECONDS}s"],
+                        )
 
                 if params:
                     await cursor.execute(query, params)
@@ -287,8 +340,35 @@ class SqlDriver:
                         transaction_started = False
                     return None
 
-                # Get results from the last statement only
-                rows = await cursor.fetchall()
+                # Get results from the last statement only, fetching
+                # incrementally and stopping at the row/byte caps so a single
+                # oversized result set cannot exhaust this process's memory.
+                max_rows = MAX_RESULT_ROWS
+                max_bytes = MAX_RESULT_BYTES
+                results: List[SqlDriver.RowResult] = []
+                bytes_fetched = 0
+                truncated = False
+                while not truncated:
+                    batch = await cursor.fetchmany(FETCH_BATCH_SIZE)
+                    if not batch:
+                        break
+                    for row in batch:
+                        if (max_rows > 0 and len(results) >= max_rows) or (max_bytes > 0 and bytes_fetched >= max_bytes):
+                            truncated = True
+                            break
+                        cells = dict(row)
+                        # Approximates the size of the text response the
+                        # caller builds from these rows.
+                        bytes_fetched += len(str(cells))
+                        results.append(SqlDriver.RowResult(cells=cells))
+
+                if truncated:
+                    self.last_truncation = ResultTruncation(
+                        rows_returned=len(results),
+                        bytes_returned=bytes_fetched,
+                        max_rows=max_rows,
+                        max_bytes=max_bytes,
+                    )
 
                 # End the transaction appropriately
                 if not force_readonly:
@@ -297,7 +377,7 @@ class SqlDriver:
                     await cursor.execute("ROLLBACK")
                     transaction_started = False
 
-                return [SqlDriver.RowResult(cells=dict(row)) for row in rows]
+                return results
 
         except Exception as e:
             # Try to roll back the transaction if it's still active

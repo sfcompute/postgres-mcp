@@ -227,6 +227,15 @@ Postgres MCP Pro supports multiple *access modes* to give you control over the o
 To use restricted mode, replace `--access-mode=unrestricted` with `--access-mode=restricted` in the configuration examples above.
 
 
+##### Result Size Limits and Statement Timeout
+
+To keep a single query from exhausting the server process's memory, results are fetched incrementally and capped. When a query hits a cap, the `execute_sql` response contains the rows that fit plus a notice asking the caller to narrow the query. The limits are configurable via environment variables (set a value to `0` to disable that limit):
+
+- `POSTGRES_MCP_MAX_RESULT_ROWS` — maximum rows returned per query (default: `5000`).
+- `POSTGRES_MCP_MAX_RESULT_BYTES` — approximate maximum size of the serialized rows returned per query (default: `5242880`, i.e. 5 MiB).
+- `POSTGRES_MCP_STATEMENT_TIMEOUT_SECONDS` — server-side `statement_timeout` applied to read-only queries (default: `30`), so a runaway query is canceled on the database server as well.
+
+
 #### Other MCP Clients
 
 Many MCP clients have similar configuration files to Claude Desktop, and you can adapt the examples above to work with the client of your choice.

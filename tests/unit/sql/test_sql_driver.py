@@ -367,11 +367,8 @@ async def test_engine_url_connection():
         assert driver.conn is not None
 
 
-def _driver_with_failing_cursor(error):
-    """A SqlDriver on a mock DbConnPool whose cursor raises `error` on execute."""
-    cursor = AsyncMock()
-    cursor.execute.side_effect = error
-
+def _driver_with_cursor(cursor):
+    """A SqlDriver on a mock DbConnPool that hands out `cursor`."""
     cursor_cm = MagicMock()
     cursor_cm.__aenter__.return_value = cursor
 
@@ -389,6 +386,24 @@ def _driver_with_failing_cursor(error):
     db_pool._is_valid = True
 
     return SqlDriver(conn=db_pool), db_pool
+
+
+def _driver_with_failing_cursor(error):
+    """A SqlDriver on a mock DbConnPool whose cursor raises `error` on execute."""
+    cursor = AsyncMock()
+    cursor.execute.side_effect = error
+    return _driver_with_cursor(cursor)
+
+
+def _cursor_with_batches(batches):
+    """A mock cursor whose fetchmany() yields `batches` then an empty batch."""
+    cursor = AsyncMock()
+    # nextset() is synchronous on psycopg cursors; an AsyncMock would return a
+    # truthy coroutine and spin the nextset loop forever.
+    cursor.nextset = MagicMock(return_value=None)
+    cursor.description = ["column1"]
+    cursor.fetchmany = AsyncMock(side_effect=[*batches, []])
+    return cursor
 
 
 @pytest.mark.asyncio
@@ -432,3 +447,145 @@ async def test_operational_error_invalidates_pool():
         await driver.execute_query("SELECT 1")
 
     assert db_pool._is_valid is False
+
+
+@pytest.mark.asyncio
+async def test_row_cap_truncates_and_stops_fetching(monkeypatch):
+    """The row cap must stop fetching mid-stream, not trim after fetchall (TOOL-1079)."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 3)
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.FETCH_BATCH_SIZE", 2)
+
+    cursor = _cursor_with_batches(
+        [
+            [{"id": 1}, {"id": 2}],
+            [{"id": 3}, {"id": 4}],
+            [{"id": 5}, {"id": 6}],
+        ]
+    )
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT * FROM big_table")
+
+    assert result is not None
+    assert [r.cells["id"] for r in result] == [1, 2, 3]
+    assert driver.last_truncation is not None
+    assert driver.last_truncation.rows_returned == 3
+    assert driver.last_truncation.max_rows == 3
+    # The cap was hit inside the second batch, so the third batch (and the
+    # trailing empty batch) must never be fetched.
+    assert cursor.fetchmany.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_byte_cap_truncates(monkeypatch):
+    """The accumulated-size cap stops fetching after the row that crosses it."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_BYTES", 10)
+
+    cursor = _cursor_with_batches([[{"v": "x" * 50}, {"v": "y" * 50}]])
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT * FROM wide_table")
+
+    assert result is not None
+    assert len(result) == 1
+    assert driver.last_truncation is not None
+    assert driver.last_truncation.rows_returned == 1
+    assert driver.last_truncation.max_bytes == 10
+    assert driver.last_truncation.bytes_returned >= 10
+
+
+@pytest.mark.asyncio
+async def test_result_under_caps_is_not_truncated():
+    """A result under both caps comes back whole with no truncation flag."""
+    cursor = _cursor_with_batches([[{"id": 1}, {"id": 2}]])
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT * FROM small_table")
+
+    assert result is not None
+    assert len(result) == 2
+    assert driver.last_truncation is None
+
+
+@pytest.mark.asyncio
+async def test_caps_disabled_return_all_rows(monkeypatch):
+    """Setting the caps to 0 disables them."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 0)
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_BYTES", 0)
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.FETCH_BATCH_SIZE", 2)
+
+    cursor = _cursor_with_batches([[{"id": 1}, {"id": 2}], [{"id": 3}]])
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT * FROM big_table")
+
+    assert result is not None
+    assert len(result) == 3
+    assert driver.last_truncation is None
+
+
+@pytest.mark.asyncio
+async def test_truncation_resets_between_queries(monkeypatch):
+    """A truncated query must not leave the flag set for the next query."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 1)
+
+    cursor = _cursor_with_batches([[{"id": 1}, {"id": 2}]])
+    driver, _ = _driver_with_cursor(cursor)
+    await driver.execute_query("SELECT * FROM big_table")
+    assert driver.last_truncation is not None
+
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 5000)
+    cursor.fetchmany = AsyncMock(side_effect=[[{"id": 1}], []])
+    await driver.execute_query("SELECT 1")
+    assert driver.last_truncation is None
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_set_for_readonly_query():
+    """Read-only queries get a transaction-scoped server-side statement_timeout."""
+    cursor = _cursor_with_batches([[{"id": 1}]])
+    driver, _ = _driver_with_cursor(cursor)
+
+    await driver.execute_query("SELECT 1", force_readonly=True)
+
+    assert call("SELECT set_config('statement_timeout', %s, true)", ["30s"]) in cursor.execute.call_args_list
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_not_set_for_non_readonly_query():
+    """Non-read-only execution keeps its behavior: no statement_timeout is injected."""
+    cursor = _cursor_with_batches([[{"id": 1}]])
+    driver, _ = _driver_with_cursor(cursor)
+
+    await driver.execute_query("SELECT 1")
+
+    executed = [c.args[0] for c in cursor.execute.call_args_list]
+    assert not any("statement_timeout" in q for q in executed)
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_disabled(monkeypatch):
+    """A non-positive timeout disables the server-side statement_timeout."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.STATEMENT_TIMEOUT_SECONDS", 0)
+
+    cursor = _cursor_with_batches([[{"id": 1}]])
+    driver, _ = _driver_with_cursor(cursor)
+
+    await driver.execute_query("SELECT 1", force_readonly=True)
+
+    executed = [c.args[0] for c in cursor.execute.call_args_list]
+    assert not any("statement_timeout" in q for q in executed)
+
+
+def test_env_int_falls_back_on_invalid_value(monkeypatch):
+    """A malformed env value must not crash the server at import time."""
+    from postgres_mcp.sql.sql_driver import _env_int  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setenv("POSTGRES_MCP_MAX_RESULT_ROWS", "not-a-number")
+    assert _env_int("POSTGRES_MCP_MAX_RESULT_ROWS", 5000) == 5000
+
+    monkeypatch.setenv("POSTGRES_MCP_MAX_RESULT_ROWS", "123")
+    assert _env_int("POSTGRES_MCP_MAX_RESULT_ROWS", 5000) == 123
+
+    monkeypatch.delenv("POSTGRES_MCP_MAX_RESULT_ROWS")
+    assert _env_int("POSTGRES_MCP_MAX_RESULT_ROWS", 5000) == 5000

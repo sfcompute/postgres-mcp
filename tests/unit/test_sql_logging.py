@@ -9,12 +9,12 @@ from unittest.mock import patch
 import pytest
 
 from postgres_mcp.server import LOGGED_SQL_MAX_LENGTH
-from postgres_mcp.server import _sql_log_handler
 from postgres_mcp.server import analyze_query_indexes
 from postgres_mcp.server import execute_sql
 from postgres_mcp.server import explain_query
 from postgres_mcp.server import log_tool_sql
 from postgres_mcp.server import sql_log
+from postgres_mcp.server import sql_log_handler
 
 LOGGER_NAME = "postgres_mcp.sql_audit"
 
@@ -79,11 +79,12 @@ def test_sql_audit_logger_bypasses_rich_and_emits_one_unwrapped_line():
     assert all(type(h).__name__ != "RichHandler" for h in sql_log.handlers)
 
     stream = io.StringIO()
-    old_stream = _sql_log_handler.setStream(stream)
+    old_stream = sql_log_handler.setStream(stream)
     try:
         log_tool_sql("execute_sql", "SELECT '" + "x" * (LOGGED_SQL_MAX_LENGTH * 2) + "'")
     finally:
-        _sql_log_handler.setStream(old_stream)
+        if old_stream is not None:
+            sql_log_handler.setStream(old_stream)
 
     out = stream.getvalue()
     assert out.endswith("\n") and out.count("\n") == 1, "line was wrapped or split"

@@ -55,9 +55,9 @@ logger = logging.getLogger(__name__)
 sql_log = logging.getLogger("postgres_mcp.sql_audit")
 sql_log.setLevel(logging.INFO)
 sql_log.propagate = False
-_sql_log_handler = logging.StreamHandler()
-_sql_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-sql_log.addHandler(_sql_log_handler)
+sql_log_handler = logging.StreamHandler()
+sql_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+sql_log.addHandler(sql_log_handler)
 
 
 class AccessMode(str, Enum):

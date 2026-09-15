@@ -23,6 +23,12 @@ from typing_extensions import LiteralString
 
 logger = logging.getLogger(__name__)
 
+# Lines quoting caller SQL go to the SQL-audit logger: entries must land as
+# single unwrapped lines, which the rich root handler breaks by wrapping at
+# terminal width. The server attaches a plain single-line handler to this
+# logger; until one is attached, records propagate to the root handler.
+sql_audit_log = logging.getLogger("postgres_mcp.sql_audit")
+
 
 def _env_int(name: str, default: int) -> int:
     """Read an integer from the environment, falling back to `default` on missing or invalid values."""
@@ -102,6 +108,18 @@ def _approx_row_size(cells: Dict[str, Any]) -> int:
         size += len(key) + 8
         size += len(value) if isinstance(value, str) else len(str(value))
     return size
+
+
+def _sanitize_for_log(text: str) -> str:
+    """Collapse caller SQL to one printable line for logging.
+
+    Control characters are blanked so crafted SQL cannot forge or overwrite
+    log entries, and password=... shapes (dblink/FDW connection strings) are
+    redacted.
+    """
+    text = " ".join(text.split())
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return obfuscate_password(text) or ""
 
 
 async def _rows_from_cursor(cursor: Any) -> AsyncGenerator[Any, None]:
@@ -386,12 +404,16 @@ class SqlDriver:
                         )
 
                 row_iter: AsyncGenerator[Any, None]
-                if _should_stream(query):
+                if force_readonly and _should_stream(query):
                     # Stream single SELECT statements row-by-row so an
                     # oversized result set is never fully buffered in this
                     # process, neither as Python objects nor in the libpq
                     # result buffer. Terminating the iteration early (a cap
                     # hit) cancels the query server-side (psycopg >= 3.2).
+                    # Read-only transactions only: a cancel aborts the
+                    # transaction, which would silently roll back the write of
+                    # a data-modifying CTE (WITH d AS (DELETE ...) SELECT ...)
+                    # while still returning its truncated rows.
                     row_iter = cursor.stream(query, params)
                 else:
                     if params:
@@ -443,9 +465,9 @@ class SqlDriver:
                         max_rows=max_rows,
                         max_bytes=max_bytes,
                     )
-                    logger.warning(
+                    sql_audit_log.warning(
                         f"Query result truncated at {len(results)} rows / ~{bytes_fetched} bytes "
-                        f"(caps: {max_rows} rows, {max_bytes} bytes): {query[:100]}"
+                        f"(caps: {max_rows} rows, {max_bytes} bytes): {_sanitize_for_log(query)[:100]}"
                     )
 
                 # End the transaction appropriately

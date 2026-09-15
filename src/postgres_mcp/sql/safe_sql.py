@@ -960,6 +960,14 @@ class SafeSqlDriver(SqlDriver):
         try:
             # Parse the SQL using pglast
             parsed = pglast.parse_sql(query)
+
+            # Multi-statement input cannot be streamed (single-row mode is one
+            # statement only), so it would fall back to execute(), which
+            # buffers the entire raw result client-side before the result-set
+            # caps can apply — one semicolon would bypass the memory bound.
+            # MCP callers can issue statements as separate calls.
+            if len(parsed) > 1:
+                raise ValueError("Multi-statement queries are not allowed in restricted mode. Issue each statement as its own call.")
             # Pretty print the parsed SQL for debugging
             # print("Parsed SQL:")
             # import pprint

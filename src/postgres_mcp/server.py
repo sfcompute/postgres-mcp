@@ -49,6 +49,16 @@ ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResou
 
 logger = logging.getLogger(__name__)
 
+# SQL attribution lines must arrive in Loki as single entries, so they bypass
+# FastMCP's rich root handler, which wraps records at terminal width and splits
+# one message across log lines — breaking the request_id join (TOOL-1081).
+sql_log = logging.getLogger("postgres_mcp.sql_audit")
+sql_log.setLevel(logging.INFO)
+sql_log.propagate = False
+_sql_log_handler = logging.StreamHandler()
+_sql_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+sql_log.addHandler(_sql_log_handler)
+
 
 class AccessMode(str, Enum):
     """SQL access modes for the server."""
@@ -441,7 +451,7 @@ def log_tool_sql(tool_name: str, sql: str) -> None:
     except Exception:
         # stdio transport, or called outside a request context.
         pass
-    logger.info(f"{tool_name} request_id={request_id} sql={text}")
+    sql_log.info(f"{tool_name} request_id={request_id} sql={text}")
 
 
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
@@ -502,7 +512,7 @@ async def analyze_query_indexes(
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
 ) -> ResponseType:
     """Analyze a list of SQL queries and recommend optimal indexes."""
-    logger.info(f"analyze_query_indexes: {len(queries)} queries")
+    sql_log.info(f"analyze_query_indexes: {len(queries)} queries")
     for query in queries:
         log_tool_sql("analyze_query_indexes", query)
     if len(queries) == 0:

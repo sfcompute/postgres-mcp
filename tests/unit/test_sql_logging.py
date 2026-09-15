@@ -1,5 +1,6 @@
-"""Tests for the execute_sql query logging (log_tool_sql)."""
+"""Tests for the SQL attribution logging (log_tool_sql / sql_audit logger)."""
 
+import io
 import logging
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -8,12 +9,23 @@ from unittest.mock import patch
 import pytest
 
 from postgres_mcp.server import LOGGED_SQL_MAX_LENGTH
+from postgres_mcp.server import _sql_log_handler
 from postgres_mcp.server import analyze_query_indexes
 from postgres_mcp.server import execute_sql
 from postgres_mcp.server import explain_query
 from postgres_mcp.server import log_tool_sql
+from postgres_mcp.server import sql_log
 
-LOGGER_NAME = "postgres_mcp.server"
+LOGGER_NAME = "postgres_mcp.sql_audit"
+
+
+@pytest.fixture(autouse=True)
+def capture_sql_audit_log(caplog):
+    # sql_log doesn't propagate to root (it bypasses the rich handler), so
+    # caplog's root-attached handler never sees it — attach it directly.
+    sql_log.addHandler(caplog.handler)
+    yield
+    sql_log.removeHandler(caplog.handler)
 
 
 def test_log_tool_sql_logs_query_at_info(caplog):
@@ -56,6 +68,26 @@ def test_log_tool_sql_without_request_context_logs_dash(caplog):
         with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
             log_tool_sql("execute_sql", "SELECT 1")
     assert "execute_sql request_id=- sql=SELECT 1" in caplog.text
+
+
+def test_sql_audit_logger_bypasses_rich_and_emits_one_unwrapped_line():
+    # The attribution line must land in Loki as ONE entry: no rich handler
+    # (which wraps at terminal width, splitting one message across entries),
+    # no propagation to the rich root handler, and no wrapping at the maximum
+    # realistic length — a full 2000-char truncated SQL stays on a single line.
+    assert sql_log.propagate is False
+    assert all(type(h).__name__ != "RichHandler" for h in sql_log.handlers)
+
+    stream = io.StringIO()
+    old_stream = _sql_log_handler.setStream(stream)
+    try:
+        log_tool_sql("execute_sql", "SELECT '" + "x" * (LOGGED_SQL_MAX_LENGTH * 2) + "'")
+    finally:
+        _sql_log_handler.setStream(old_stream)
+
+    out = stream.getvalue()
+    assert out.endswith("\n") and out.count("\n") == 1, "line was wrapped or split"
+    assert len(out) > LOGGED_SQL_MAX_LENGTH, "truncated SQL payload must survive on the one line"
 
 
 def test_log_tool_sql_blanks_control_characters(caplog):

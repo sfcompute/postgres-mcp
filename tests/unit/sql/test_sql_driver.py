@@ -389,20 +389,41 @@ def _driver_with_cursor(cursor):
 
 
 def _driver_with_failing_cursor(error):
-    """A SqlDriver on a mock DbConnPool whose cursor raises `error` on execute."""
+    """A SqlDriver on a mock DbConnPool whose cursor raises `error` on execute or stream."""
     cursor = AsyncMock()
     cursor.execute.side_effect = error
+
+    async def _stream(query, params=None):
+        raise error
+        yield  # unreachable; makes this an async generator like the real stream()
+
+    cursor.stream = _stream
     return _driver_with_cursor(cursor)
 
 
-def _cursor_with_batches(batches):
-    """A mock cursor whose fetchmany() yields `batches` then an empty batch."""
+def _cursor_with_rows(rows):
+    """A mock cursor serving `rows` through both fetch paths.
+
+    Which path runs depends on the query: a single plain SELECT goes through
+    cursor.stream(); everything else executes and then fetches row-by-row.
+    `cursor.streamed` records the rows the stream generator actually yielded,
+    to assert early termination.
+    """
     cursor = AsyncMock()
     # nextset() is synchronous on psycopg cursors; an AsyncMock would return a
     # truthy coroutine and spin the nextset loop forever.
     cursor.nextset = MagicMock(return_value=None)
     cursor.description = ["column1"]
-    cursor.fetchmany = AsyncMock(side_effect=[*batches, []])
+    cursor.fetchone = AsyncMock(side_effect=[*rows, None])
+    streamed = []
+
+    async def _stream(query, params=None):
+        for row in rows:
+            streamed.append(row)
+            yield row
+
+    cursor.stream = _stream
+    cursor.streamed = streamed
     return cursor
 
 
@@ -450,18 +471,11 @@ async def test_operational_error_invalidates_pool():
 
 
 @pytest.mark.asyncio
-async def test_row_cap_truncates_and_stops_fetching(monkeypatch):
-    """The row cap must stop fetching mid-stream, not trim after fetchall (TOOL-1079)."""
+async def test_row_cap_truncates_and_stops_streaming(monkeypatch, caplog):
+    """The row cap must stop consumption mid-stream, not trim a fully fetched result (TOOL-1079)."""
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 3)
-    monkeypatch.setattr("postgres_mcp.sql.sql_driver.FETCH_BATCH_SIZE", 2)
 
-    cursor = _cursor_with_batches(
-        [
-            [{"id": 1}, {"id": 2}],
-            [{"id": 3}, {"id": 4}],
-            [{"id": 5}, {"id": 6}],
-        ]
-    )
+    cursor = _cursor_with_rows([{"id": i} for i in range(1, 7)])
     driver, _ = _driver_with_cursor(cursor)
 
     result = await driver.execute_query("SELECT * FROM big_table")
@@ -471,17 +485,54 @@ async def test_row_cap_truncates_and_stops_fetching(monkeypatch):
     assert driver.last_truncation is not None
     assert driver.last_truncation.rows_returned == 3
     assert driver.last_truncation.max_rows == 3
-    # The cap was hit inside the second batch, so the third batch (and the
-    # trailing empty batch) must never be fetched.
-    assert cursor.fetchmany.await_count == 2
+    # A single SELECT goes through cursor.stream(), and the cap must terminate
+    # the stream early: 3 kept rows plus the one probe row that hit the cap.
+    assert cursor.fetchone.await_count == 0
+    assert len(cursor.streamed) == 4
+    assert "truncated" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_byte_cap_truncates(monkeypatch):
-    """The accumulated-size cap stops fetching after the row that crosses it."""
+async def test_multi_statement_uses_fetch_path_and_caps(monkeypatch):
+    """Multi-statement input cannot stream; the row-by-row fetch path must cap it too."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 2)
+
+    cursor = _cursor_with_rows([{"a": 1}, {"a": 2}, {"a": 3}])
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT 1 AS a; SELECT 2 AS b")
+
+    assert result is not None
+    assert len(result) == 2
+    assert driver.last_truncation is not None
+    assert cursor.streamed == []
+    # 2 kept rows plus the one probe row that hit the cap.
+    assert cursor.fetchone.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_single_oversized_row_is_dropped(monkeypatch):
+    """A lone row over the byte cap is dropped and flagged, never returned whole."""
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_BYTES", 10)
 
-    cursor = _cursor_with_batches([[{"v": "x" * 50}, {"v": "y" * 50}]])
+    cursor = _cursor_with_rows([{"v": "x" * 50}])
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT * FROM wide_table")
+
+    assert result == []
+    assert driver.last_truncation is not None
+    assert driver.last_truncation.rows_returned == 0
+    assert driver.last_truncation.max_bytes == 10
+
+
+@pytest.mark.asyncio
+async def test_byte_cap_drops_the_crossing_row(monkeypatch):
+    """The row that would cross the accumulated-byte cap is dropped, keeping the result under the cap."""
+    # _approx_row_size({"v": "x" * 40}) == len("v") + 8 + 40 == 49
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_BYTES", 60)
+
+    cursor = _cursor_with_rows([{"v": "x" * 40}, {"v": "y" * 40}])
     driver, _ = _driver_with_cursor(cursor)
 
     result = await driver.execute_query("SELECT * FROM wide_table")
@@ -490,14 +541,13 @@ async def test_byte_cap_truncates(monkeypatch):
     assert len(result) == 1
     assert driver.last_truncation is not None
     assert driver.last_truncation.rows_returned == 1
-    assert driver.last_truncation.max_bytes == 10
-    assert driver.last_truncation.bytes_returned >= 10
+    assert driver.last_truncation.bytes_returned == 49
 
 
 @pytest.mark.asyncio
 async def test_result_under_caps_is_not_truncated():
     """A result under both caps comes back whole with no truncation flag."""
-    cursor = _cursor_with_batches([[{"id": 1}, {"id": 2}]])
+    cursor = _cursor_with_rows([{"id": 1}, {"id": 2}])
     driver, _ = _driver_with_cursor(cursor)
 
     result = await driver.execute_query("SELECT * FROM small_table")
@@ -512,9 +562,8 @@ async def test_caps_disabled_return_all_rows(monkeypatch):
     """Setting the caps to 0 disables them."""
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 0)
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_BYTES", 0)
-    monkeypatch.setattr("postgres_mcp.sql.sql_driver.FETCH_BATCH_SIZE", 2)
 
-    cursor = _cursor_with_batches([[{"id": 1}, {"id": 2}], [{"id": 3}]])
+    cursor = _cursor_with_rows([{"id": 1}, {"id": 2}, {"id": 3}])
     driver, _ = _driver_with_cursor(cursor)
 
     result = await driver.execute_query("SELECT * FROM big_table")
@@ -529,21 +578,20 @@ async def test_truncation_resets_between_queries(monkeypatch):
     """A truncated query must not leave the flag set for the next query."""
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 1)
 
-    cursor = _cursor_with_batches([[{"id": 1}, {"id": 2}]])
+    cursor = _cursor_with_rows([{"id": 1}, {"id": 2}])
     driver, _ = _driver_with_cursor(cursor)
     await driver.execute_query("SELECT * FROM big_table")
     assert driver.last_truncation is not None
 
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 5000)
-    cursor.fetchmany = AsyncMock(side_effect=[[{"id": 1}], []])
-    await driver.execute_query("SELECT 1")
+    await driver.execute_query("SELECT * FROM big_table")
     assert driver.last_truncation is None
 
 
 @pytest.mark.asyncio
 async def test_statement_timeout_set_for_readonly_query():
     """Read-only queries get a transaction-scoped server-side statement_timeout."""
-    cursor = _cursor_with_batches([[{"id": 1}]])
+    cursor = _cursor_with_rows([{"id": 1}])
     driver, _ = _driver_with_cursor(cursor)
 
     await driver.execute_query("SELECT 1", force_readonly=True)
@@ -554,7 +602,7 @@ async def test_statement_timeout_set_for_readonly_query():
 @pytest.mark.asyncio
 async def test_statement_timeout_not_set_for_non_readonly_query():
     """Non-read-only execution keeps its behavior: no statement_timeout is injected."""
-    cursor = _cursor_with_batches([[{"id": 1}]])
+    cursor = _cursor_with_rows([{"id": 1}])
     driver, _ = _driver_with_cursor(cursor)
 
     await driver.execute_query("SELECT 1")
@@ -568,13 +616,38 @@ async def test_statement_timeout_disabled(monkeypatch):
     """A non-positive timeout disables the server-side statement_timeout."""
     monkeypatch.setattr("postgres_mcp.sql.sql_driver.STATEMENT_TIMEOUT_SECONDS", 0)
 
-    cursor = _cursor_with_batches([[{"id": 1}]])
+    cursor = _cursor_with_rows([{"id": 1}])
     driver, _ = _driver_with_cursor(cursor)
 
     await driver.execute_query("SELECT 1", force_readonly=True)
 
     executed = [c.args[0] for c in cursor.execute.call_args_list]
     assert not any("statement_timeout" in q for q in executed)
+
+
+def test_should_stream_only_single_plain_selects():
+    """Streaming applies exactly to single SELECT statements that return rows."""
+    from postgres_mcp.sql.sql_driver import _should_stream  # pyright: ignore[reportPrivateUsage]
+
+    assert _should_stream("SELECT * FROM users") is True
+    assert _should_stream("WITH x AS (SELECT 1) SELECT * FROM x") is True
+    assert _should_stream("/* crystaldba */ SELECT 1") is True
+    assert _should_stream("SELECT 1; SELECT 2") is False
+    assert _should_stream("CREATE TABLE t (x int)") is False
+    assert _should_stream("EXPLAIN SELECT 1") is False
+    assert _should_stream("SELECT 1 INTO t") is False
+    assert _should_stream("not valid sql") is False
+
+
+def test_client_query_timeout_tracks_statement_timeout(monkeypatch):
+    """The restricted-mode client timeout derives from the server timeout instead of overriding it."""
+    from postgres_mcp.sql.sql_driver import client_query_timeout_seconds
+
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.STATEMENT_TIMEOUT_SECONDS", 120)
+    assert client_query_timeout_seconds() == 125
+
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.STATEMENT_TIMEOUT_SECONDS", 0)
+    assert client_query_timeout_seconds() is None
 
 
 def test_env_int_falls_back_on_invalid_value(monkeypatch):

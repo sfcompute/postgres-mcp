@@ -4,8 +4,10 @@ import asyncio
 import logging
 import os
 import re
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
+from typing import AsyncGenerator
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -13,6 +15,8 @@ from urllib.parse import urlparse
 from urllib.parse import urlunparse
 
 import psycopg
+from pglast.ast import SelectStmt
+from pglast.parser import parse_sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString
@@ -43,7 +47,20 @@ MAX_RESULT_BYTES = _env_int("POSTGRES_MCP_MAX_RESULT_BYTES", 5 * 1024 * 1024)
 # client-side. <= 0 disables it.
 STATEMENT_TIMEOUT_SECONDS = _env_int("POSTGRES_MCP_STATEMENT_TIMEOUT_SECONDS", 30)
 
-FETCH_BATCH_SIZE = 500
+CLIENT_TIMEOUT_GRACE_SECONDS = 5
+
+
+def client_query_timeout_seconds() -> Optional[int]:
+    """Client-side query timeout paired with the server statement_timeout.
+
+    Slightly above the server timeout so the server cancels first — a clean
+    QueryCanceled that keeps the pooled connection healthy — leaving the client
+    timeout to catch only what the server timeout cannot (e.g. network stalls).
+    Returns None (no client timeout) when the server timeout is disabled.
+    """
+    if STATEMENT_TIMEOUT_SECONDS <= 0:
+        return None
+    return STATEMENT_TIMEOUT_SECONDS + CLIENT_TIMEOUT_GRACE_SECONDS
 
 
 @dataclass
@@ -54,6 +71,51 @@ class ResultTruncation:
     bytes_returned: int
     max_rows: int
     max_bytes: int
+
+
+def _should_stream(query: str) -> bool:
+    """Whether to fetch with cursor.stream(): a single plain SELECT.
+
+    Streaming keeps an oversized result set out of the client-side libpq
+    buffer (execute() would transfer it whole before the first fetch), but
+    single-row mode supports neither multiple statements nor statements that
+    return no rows, so anything else keeps the fetch-after-execute path.
+    """
+    try:
+        statements = parse_sql(query)
+    except Exception:
+        return False
+    if len(statements) != 1:
+        return False
+    statement = statements[0].stmt
+    return isinstance(statement, SelectStmt) and statement.intoClause is None
+
+
+def _approx_row_size(cells: Dict[str, Any]) -> int:
+    """Approximate the serialized size of a row.
+
+    Sums per-value sizes instead of len(str(cells)) so a huge string value is
+    measured without making another full copy of it.
+    """
+    size = 0
+    for key, value in cells.items():
+        size += len(key) + 8
+        size += len(value) if isinstance(value, str) else len(str(value))
+    return size
+
+
+async def _rows_from_cursor(cursor: Any) -> AsyncGenerator[Any, None]:
+    """Yield the cursor's remaining rows one at a time.
+
+    fetchmany/fetchall materialize every fetched row as a Python object before
+    the caller can apply any cap; one row per step bounds that spike to a
+    single row.
+    """
+    while True:
+        row = await cursor.fetchone()
+        if row is None:
+            return
+        yield row
 
 
 def _invalidates_pool(e: BaseException) -> bool:
@@ -323,43 +385,55 @@ class SqlDriver:
                             [f"{STATEMENT_TIMEOUT_SECONDS}s"],
                         )
 
-                if params:
-                    await cursor.execute(query, params)
+                row_iter: AsyncGenerator[Any, None]
+                if _should_stream(query):
+                    # Stream single SELECT statements row-by-row so an
+                    # oversized result set is never fully buffered in this
+                    # process, neither as Python objects nor in the libpq
+                    # result buffer. Terminating the iteration early (a cap
+                    # hit) cancels the query server-side (psycopg >= 3.2).
+                    row_iter = cursor.stream(query, params)
                 else:
-                    await cursor.execute(query)
+                    if params:
+                        await cursor.execute(query, params)
+                    else:
+                        await cursor.execute(query)
 
-                # For multiple statements, move to the last statement's results
-                while cursor.nextset():
-                    pass
+                    # For multiple statements, move to the last statement's results
+                    while cursor.nextset():
+                        pass
 
-                if cursor.description is None:  # No results (like DDL statements)
-                    if not force_readonly:
-                        await cursor.execute("COMMIT")
-                    elif transaction_started:
-                        await cursor.execute("ROLLBACK")
-                        transaction_started = False
-                    return None
+                    if cursor.description is None:  # No results (like DDL statements)
+                        if not force_readonly:
+                            await cursor.execute("COMMIT")
+                        elif transaction_started:
+                            await cursor.execute("ROLLBACK")
+                            transaction_started = False
+                        return None
 
-                # Get results from the last statement only, fetching
-                # incrementally and stopping at the row/byte caps so a single
-                # oversized result set cannot exhaust this process's memory.
+                    row_iter = _rows_from_cursor(cursor)
+
+                # Consume one row at a time and stop at the caps so a single
+                # oversized result set cannot exhaust this process's memory:
+                # at most one over-cap row is ever materialized, and the row
+                # that would cross a cap is dropped rather than returned.
                 max_rows = MAX_RESULT_ROWS
                 max_bytes = MAX_RESULT_BYTES
                 results: List[SqlDriver.RowResult] = []
                 bytes_fetched = 0
                 truncated = False
-                while not truncated:
-                    batch = await cursor.fetchmany(FETCH_BATCH_SIZE)
-                    if not batch:
-                        break
-                    for row in batch:
-                        if (max_rows > 0 and len(results) >= max_rows) or (max_bytes > 0 and bytes_fetched >= max_bytes):
+                async with aclosing(row_iter) as rows:
+                    async for row in rows:
+                        if max_rows > 0 and len(results) >= max_rows:
                             truncated = True
                             break
                         cells = dict(row)
-                        # Approximates the size of the text response the
-                        # caller builds from these rows.
-                        bytes_fetched += len(str(cells))
+                        if max_bytes > 0:
+                            size = _approx_row_size(cells)
+                            if bytes_fetched + size > max_bytes:
+                                truncated = True
+                                break
+                            bytes_fetched += size
                         results.append(SqlDriver.RowResult(cells=cells))
 
                 if truncated:
@@ -368,6 +442,10 @@ class SqlDriver:
                         bytes_returned=bytes_fetched,
                         max_rows=max_rows,
                         max_bytes=max_bytes,
+                    )
+                    logger.warning(
+                        f"Query result truncated at {len(results)} rows / ~{bytes_fetched} bytes "
+                        f"(caps: {max_rows} rows, {max_bytes} bytes): {query[:100]}"
                     )
 
                 # End the transaction appropriately

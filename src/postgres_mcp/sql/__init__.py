@@ -13,6 +13,7 @@ from .safe_sql import SafeSqlDriver
 from .sql_driver import DbConnPool
 from .sql_driver import ResultTruncation
 from .sql_driver import SqlDriver
+from .sql_driver import client_query_timeout_seconds
 from .sql_driver import obfuscate_password
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "check_extension",
     "check_hypopg_installation_status",
     "check_postgres_version_requirement",
+    "client_query_timeout_seconds",
     "get_postgres_version",
     "obfuscate_password",
     "reset_postgres_version_cache",

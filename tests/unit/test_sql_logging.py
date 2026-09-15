@@ -8,7 +8,9 @@ from unittest.mock import patch
 import pytest
 
 from postgres_mcp.server import LOGGED_SQL_MAX_LENGTH
+from postgres_mcp.server import analyze_query_indexes
 from postgres_mcp.server import execute_sql
+from postgres_mcp.server import explain_query
 from postgres_mcp.server import log_tool_sql
 
 LOGGER_NAME = "postgres_mcp.server"
@@ -54,6 +56,47 @@ def test_log_tool_sql_without_request_context_logs_dash(caplog):
         with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
             log_tool_sql("execute_sql", "SELECT 1")
     assert "execute_sql request_id=- sql=SELECT 1" in caplog.text
+
+
+def test_log_tool_sql_blanks_control_characters(caplog):
+    # Raw ESC survives whitespace collapsing; it must not reach the log record,
+    # or crafted SQL could overwrite output in a terminal tailing the logs.
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        log_tool_sql("execute_sql", "SELECT '\x1b[2K\x1b[1Aspoofed'")
+    [record] = caplog.records
+    assert "\x1b" not in record.message
+    assert "spoofed" in record.message
+
+
+def test_log_tool_sql_obfuscates_passwords(caplog):
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        log_tool_sql(
+            "execute_sql",
+            "SELECT * FROM dblink('host=db.internal password=hunter2', 'SELECT 1') AS t(x int)",
+        )
+    [record] = caplog.records
+    assert "hunter2" not in record.message
+    assert "password=****" in record.message
+
+
+@pytest.mark.asyncio
+async def test_explain_query_logs_sql_before_running_it(caplog):
+    # analyze=True executes the caller's query, so the crash-attribution log
+    # must land before the driver runs — even when the driver fails.
+    with patch("postgres_mcp.server.get_sql_driver", AsyncMock(side_effect=RuntimeError("connection lost"))):
+        with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+            await explain_query(sql="SELECT pg_sleep(600)", analyze=True, hypothetical_indexes=[])
+    assert "explain_query[analyze] request_id=- sql=SELECT pg_sleep(600)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_indexes_logs_count_and_each_query(caplog):
+    with patch("postgres_mcp.server.get_sql_driver", AsyncMock(side_effect=RuntimeError("connection lost"))):
+        with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+            await analyze_query_indexes(queries=["SELECT 1", "SELECT 2"], max_index_size_mb=10000, method="dta")
+    assert "analyze_query_indexes: 2 queries" in caplog.text
+    assert "analyze_query_indexes request_id=- sql=SELECT 1" in caplog.text
+    assert "analyze_query_indexes request_id=- sql=SELECT 2" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -366,6 +366,9 @@ If there is no hypothetical index, you can pass an empty list.""",
         analyze: When True, actually runs the query for real statistics
         hypothetical_indexes: Optional list of indexes to simulate
     """
+    # With analyze=True this executes the caller's query, so it can crash the
+    # server just like execute_sql — log it the same way.
+    log_tool_sql("explain_query[analyze]" if analyze else "explain_query", sql)
     try:
         sql_driver = await get_sql_driver()
         explain_tool = ExplainPlanTool(sql_driver=sql_driver)
@@ -423,6 +426,11 @@ def log_tool_sql(tool_name: str, sql: str) -> None:
     when one is present so the query can be correlated with upstream proxy logs.
     """
     text = " ".join(sql.split())
+    # Blank remaining control characters (e.g. raw ESC): crafted SQL must not
+    # be able to spoof or overwrite output in terminals tailing the logs.
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    # Redact password=... shapes (dblink/FDW connection strings).
+    text = obfuscate_password(text) or ""
     if len(text) > LOGGED_SQL_MAX_LENGTH:
         text = f"{text[:LOGGED_SQL_MAX_LENGTH]}... [truncated, {len(sql)} chars total]"
     request_id = "-"
@@ -494,6 +502,9 @@ async def analyze_query_indexes(
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
 ) -> ResponseType:
     """Analyze a list of SQL queries and recommend optimal indexes."""
+    logger.info(f"analyze_query_indexes: {len(queries)} queries")
+    for query in queries:
+        log_tool_sql("analyze_query_indexes", query)
     if len(queries) == 0:
         return format_error_response("Please provide a non-empty list of queries to analyze.")
     if len(queries) > MAX_NUM_INDEX_TUNING_QUERIES:

@@ -227,6 +227,17 @@ Postgres MCP Pro supports multiple *access modes* to give you control over the o
 To use restricted mode, replace `--access-mode=unrestricted` with `--access-mode=restricted` in the configuration examples above.
 
 
+##### Result Size Limits and Statement Timeout
+
+Query results are consumed one row at a time and capped: fetching stops at the row cap or at the first row that would cross the byte cap (that row is dropped, so even a single oversized row is never returned). Single `SELECT` statements — the shape an arbitrarily large result comes from — are additionally streamed from the server in single-row mode, so an oversized result set is not buffered in the server process's memory either; a cap hit cancels the query on the database server. Multi-statement input and non-`SELECT` statements keep the regular fetch path, whose raw result the PostgreSQL client library still transfers in full before the caps apply. When a query hits a cap, the `execute_sql` response contains the rows that fit plus a notice asking the caller to narrow the query, and the server logs a warning.
+
+The limits are configurable via environment variables (set a value to `0` to disable that limit):
+
+- `POSTGRES_MCP_MAX_RESULT_ROWS` — maximum rows returned per query (default: `5000`).
+- `POSTGRES_MCP_MAX_RESULT_BYTES` — approximate maximum size of the serialized rows returned per query (default: `5242880`, i.e. 5 MiB).
+- `POSTGRES_MCP_STATEMENT_TIMEOUT_SECONDS` — server-side `statement_timeout` applied to read-only queries (default: `30`), so a runaway query is canceled on the database server as well. In restricted mode the client-side query timeout is derived from the same value (plus a small grace period), so raising or disabling this variable also raises or disables the client-side timeout.
+
+
 #### Other MCP Clients
 
 Many MCP clients have similar configuration files to Claude Desktop, and you can adapt the examples above to work with the client of your choice.

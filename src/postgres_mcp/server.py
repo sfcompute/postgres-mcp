@@ -31,6 +31,7 @@ from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
+from .sql import client_query_timeout_seconds
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
 
@@ -65,7 +66,7 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+        return SafeSqlDriver(sql_driver=base_driver, timeout=client_query_timeout_seconds())
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
@@ -421,6 +422,14 @@ async def execute_sql(
         rows = await sql_driver.execute_query(sql)  # type: ignore
         if rows is None:
             return format_text_response("No results")
+        truncation = sql_driver.last_truncation
+        if truncation is not None:
+            return format_text_response(
+                f"{list([r.cells for r in rows])}\n\n"
+                f"NOTICE: result truncated at {truncation.rows_returned} rows "
+                f"(server caps: POSTGRES_MCP_MAX_RESULT_ROWS={truncation.max_rows}, POSTGRES_MCP_MAX_RESULT_BYTES={truncation.max_bytes}). "
+                "Narrow the query — add a LIMIT, a tighter WHERE clause, or an aggregate — instead of retrying."
+            )
         return format_text_response(list([r.cells for r in rows]))
     except Exception as e:
         logger.error(f"Error executing query: {e}")

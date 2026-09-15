@@ -1017,30 +1017,34 @@ class SafeSqlDriver(SqlDriver):
         if unknown_funcs:
             await self._reject_unproven_functions(unknown_funcs)
 
+        self.last_truncation = None
         # NOTE: Always force readonly=True in SafeSqlDriver regardless of what was passed
-        if self.timeout:
-            try:
-                async with asyncio.timeout(self.timeout):
-                    return await self.sql_driver.execute_query(
-                        f"/* crystaldba */ {query}",
-                        params=params,
-                        force_readonly=True,
-                    )
-            except asyncio.TimeoutError as e:
-                logger.warning(f"Query execution timed out after {self.timeout} seconds: {query[:100]}...")
-                raise ValueError(
-                    f"Query execution timed out after {self.timeout} seconds in restricted mode. "
-                    "Consider simplifying your query or increasing the timeout."
-                ) from e
-            except Exception as e:
-                logger.error(f"Error executing query: {e}")
-                raise
-        else:
-            return await self.sql_driver.execute_query(
-                f"/* crystaldba */ {query}",
-                params=params,
-                force_readonly=True,
-            )
+        try:
+            if self.timeout:
+                try:
+                    async with asyncio.timeout(self.timeout):
+                        return await self.sql_driver.execute_query(
+                            f"/* crystaldba */ {query}",
+                            params=params,
+                            force_readonly=True,
+                        )
+                except asyncio.TimeoutError as e:
+                    logger.warning(f"Query execution timed out after {self.timeout} seconds: {query[:100]}...")
+                    raise ValueError(
+                        f"Query execution timed out after {self.timeout} seconds in restricted mode. "
+                        "Consider simplifying your query or increasing the timeout."
+                    ) from e
+                except Exception as e:
+                    logger.error(f"Error executing query: {e}")
+                    raise
+            else:
+                return await self.sql_driver.execute_query(
+                    f"/* crystaldba */ {query}",
+                    params=params,
+                    force_readonly=True,
+                )
+        finally:
+            self.last_truncation = self.sql_driver.last_truncation
 
     @staticmethod
     def sql_to_query(sql: Composable) -> str:

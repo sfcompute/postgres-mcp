@@ -7,6 +7,7 @@ import pytest_asyncio
 from psycopg.sql import SQL
 from psycopg.sql import Literal
 
+from postgres_mcp.sql import ResultTruncation
 from postgres_mcp.sql import SafeSqlDriver
 from postgres_mcp.sql import SqlDriver
 
@@ -842,3 +843,14 @@ async def test_query_with_whitespace(safe_driver, mock_sql_driver):
     """
     await safe_driver.execute_query(query)
     mock_sql_driver.execute_query.assert_awaited_once_with("/* crystaldba */ " + query, params=None, force_readonly=True)
+
+
+@pytest.mark.asyncio
+async def test_last_truncation_mirrors_wrapped_driver(safe_driver, mock_sql_driver):
+    """SafeSqlDriver exposes the wrapped driver's truncation info to callers holding only the wrapper."""
+    truncation = ResultTruncation(rows_returned=5, bytes_returned=100, max_rows=5, max_bytes=1000)
+    mock_sql_driver.last_truncation = truncation
+
+    await safe_driver.execute_query("SELECT * FROM users")
+
+    assert safe_driver.last_truncation is truncation

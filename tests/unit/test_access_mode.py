@@ -40,7 +40,8 @@ async def test_get_sql_driver_returns_correct_driver(access_mode, expected_drive
         # When in RESTRICTED mode, verify timeout is set
         if access_mode == AccessMode.RESTRICTED:
             assert isinstance(driver, SafeSqlDriver)
-            assert driver.timeout == 30
+            # Server statement_timeout (default 30s) plus the client-side grace.
+            assert driver.timeout == 35
 
 
 @pytest.mark.asyncio
@@ -52,8 +53,27 @@ async def test_get_sql_driver_sets_timeout_in_restricted_mode(mock_db_connection
     ):
         driver = await get_sql_driver()
         assert isinstance(driver, SafeSqlDriver)
-        assert driver.timeout == 30
+        # Server statement_timeout (default 30s) plus the client-side grace.
+        assert driver.timeout == 35
         assert hasattr(driver, "sql_driver")
+
+
+@pytest.mark.asyncio
+async def test_restricted_client_timeout_follows_statement_timeout_env(mock_db_connection, monkeypatch):
+    """POSTGRES_MCP_STATEMENT_TIMEOUT_SECONDS drives the restricted-mode client timeout: raised values take effect and 0 disables it."""
+    with (
+        patch("postgres_mcp.server.current_access_mode", AccessMode.RESTRICTED),
+        patch("postgres_mcp.server.db_connection", mock_db_connection),
+    ):
+        monkeypatch.setattr("postgres_mcp.sql.sql_driver.STATEMENT_TIMEOUT_SECONDS", 120)
+        driver = await get_sql_driver()
+        assert isinstance(driver, SafeSqlDriver)
+        assert driver.timeout == 125
+
+        monkeypatch.setattr("postgres_mcp.sql.sql_driver.STATEMENT_TIMEOUT_SECONDS", 0)
+        driver = await get_sql_driver()
+        assert isinstance(driver, SafeSqlDriver)
+        assert driver.timeout is None
 
 
 @pytest.mark.asyncio

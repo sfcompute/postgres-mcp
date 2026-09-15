@@ -41,6 +41,10 @@ mcp = FastMCP("postgres-mcp")
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
 
+# Enough of the SQL to identify a query in logs without letting a giant literal
+# bloat the log stream.
+LOGGED_SQL_MAX_LENGTH = 2000
+
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
 logger = logging.getLogger(__name__)
@@ -411,11 +415,33 @@ If there is no hypothetical index, you can pass an empty list.""",
         return format_error_response(str(e))
 
 
+def log_tool_sql(tool_name: str, sql: str) -> None:
+    """Log the SQL a tool was asked to run, before it runs.
+
+    If the query kills the server (e.g. an OOM on a huge result set), this is
+    the log line that identifies it. Includes the caller's x-request-id header
+    when one is present so the query can be correlated with upstream proxy logs.
+    """
+    text = " ".join(sql.split())
+    if len(text) > LOGGED_SQL_MAX_LENGTH:
+        text = f"{text[:LOGGED_SQL_MAX_LENGTH]}... [truncated, {len(sql)} chars total]"
+    request_id = "-"
+    try:
+        request = mcp.get_context().request_context.request
+        if request is not None:
+            request_id = request.headers.get("x-request-id") or "-"
+    except Exception:
+        # stdio transport, or called outside a request context.
+        pass
+    logger.info(f"{tool_name} request_id={request_id} sql={text}")
+
+
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
+    log_tool_sql("execute_sql", sql)
     try:
         sql_driver = await get_sql_driver()
         rows = await sql_driver.execute_query(sql)  # type: ignore

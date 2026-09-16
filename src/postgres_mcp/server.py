@@ -42,9 +42,23 @@ mcp = FastMCP("postgres-mcp")
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
 
+# Enough of the SQL to identify a query in logs without letting a giant literal
+# bloat the log stream.
+LOGGED_SQL_MAX_LENGTH = 2000
+
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
 logger = logging.getLogger(__name__)
+
+# SQL attribution lines must arrive in Loki as single entries, so they bypass
+# FastMCP's rich root handler, which wraps records at terminal width and splits
+# one message across log lines — breaking the request_id join (TOOL-1081).
+sql_log = logging.getLogger("postgres_mcp.sql_audit")
+sql_log.setLevel(logging.INFO)
+sql_log.propagate = False
+sql_log_handler = logging.StreamHandler()
+sql_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+sql_log.addHandler(sql_log_handler)
 
 
 class AccessMode(str, Enum):
@@ -363,6 +377,9 @@ If there is no hypothetical index, you can pass an empty list.""",
         analyze: When True, actually runs the query for real statistics
         hypothetical_indexes: Optional list of indexes to simulate
     """
+    # With analyze=True this executes the caller's query, so it can crash the
+    # server just like execute_sql — log it the same way.
+    log_tool_sql("explain_query[analyze]" if analyze else "explain_query", sql)
     try:
         sql_driver = await get_sql_driver()
         explain_tool = ExplainPlanTool(sql_driver=sql_driver)
@@ -412,11 +429,38 @@ If there is no hypothetical index, you can pass an empty list.""",
         return format_error_response(str(e))
 
 
+def log_tool_sql(tool_name: str, sql: str) -> None:
+    """Log the SQL a tool was asked to run, before it runs.
+
+    If the query kills the server (e.g. an OOM on a huge result set), this is
+    the log line that identifies it. Includes the caller's x-request-id header
+    when one is present so the query can be correlated with upstream proxy logs.
+    """
+    text = " ".join(sql.split())
+    # Blank remaining control characters (e.g. raw ESC): crafted SQL must not
+    # be able to spoof or overwrite output in terminals tailing the logs.
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    # Redact password=... shapes (dblink/FDW connection strings).
+    text = obfuscate_password(text) or ""
+    if len(text) > LOGGED_SQL_MAX_LENGTH:
+        text = f"{text[:LOGGED_SQL_MAX_LENGTH]}... [truncated, {len(sql)} chars total]"
+    request_id = "-"
+    try:
+        request = mcp.get_context().request_context.request
+        if request is not None:
+            request_id = request.headers.get("x-request-id") or "-"
+    except Exception:
+        # stdio transport, or called outside a request context.
+        pass
+    sql_log.info(f"{tool_name} request_id={request_id} sql={text}")
+
+
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
+    log_tool_sql("execute_sql", sql)
     try:
         sql_driver = await get_sql_driver()
         rows = await sql_driver.execute_query(sql)  # type: ignore
@@ -477,6 +521,9 @@ async def analyze_query_indexes(
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
 ) -> ResponseType:
     """Analyze a list of SQL queries and recommend optimal indexes."""
+    sql_log.info(f"analyze_query_indexes: {len(queries)} queries")
+    for query in queries:
+        log_tool_sql("analyze_query_indexes", query)
     if len(queries) == 0:
         return format_error_response("Please provide a non-empty list of queries to analyze.")
     if len(queries) > MAX_NUM_INDEX_TUNING_QUERIES:

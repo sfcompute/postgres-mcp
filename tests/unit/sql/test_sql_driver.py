@@ -478,15 +478,15 @@ async def test_row_cap_truncates_and_stops_streaming(monkeypatch, caplog):
     cursor = _cursor_with_rows([{"id": i} for i in range(1, 7)])
     driver, _ = _driver_with_cursor(cursor)
 
-    result = await driver.execute_query("SELECT * FROM big_table")
+    result = await driver.execute_query("SELECT * FROM big_table", force_readonly=True)
 
     assert result is not None
     assert [r.cells["id"] for r in result] == [1, 2, 3]
     assert driver.last_truncation is not None
     assert driver.last_truncation.rows_returned == 3
     assert driver.last_truncation.max_rows == 3
-    # A single SELECT goes through cursor.stream(), and the cap must terminate
-    # the stream early: 3 kept rows plus the one probe row that hit the cap.
+    # A read-only single SELECT goes through cursor.stream(), and the cap must
+    # terminate the stream early: 3 kept rows plus the probe row that hit it.
     assert cursor.fetchone.await_count == 0
     assert len(cursor.streamed) == 4
     assert "truncated" in caplog.text
@@ -518,7 +518,7 @@ async def test_single_oversized_row_is_dropped(monkeypatch):
     cursor = _cursor_with_rows([{"v": "x" * 50}])
     driver, _ = _driver_with_cursor(cursor)
 
-    result = await driver.execute_query("SELECT * FROM wide_table")
+    result = await driver.execute_query("SELECT * FROM wide_table", force_readonly=True)
 
     assert result == []
     assert driver.last_truncation is not None
@@ -623,6 +623,38 @@ async def test_statement_timeout_disabled(monkeypatch):
 
     executed = [c.args[0] for c in cursor.execute.call_args_list]
     assert not any("statement_timeout" in q for q in executed)
+
+
+@pytest.mark.asyncio
+async def test_non_readonly_select_does_not_stream():
+    """Streaming is read-only-only: a cap-triggered cancel would silently roll back the write of a data-modifying CTE."""
+    cursor = _cursor_with_rows([{"id": 1}])
+    driver, _ = _driver_with_cursor(cursor)
+
+    result = await driver.execute_query("SELECT * FROM t")
+
+    assert result is not None
+    assert len(result) == 1
+    assert cursor.streamed == []
+    # One row plus the None that ends the fetch loop.
+    assert cursor.fetchone.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_truncation_warning_is_sanitized(monkeypatch, caplog):
+    """The truncation WARN quotes caller SQL: control characters must be blanked so it can't forge log lines."""
+    monkeypatch.setattr("postgres_mcp.sql.sql_driver.MAX_RESULT_ROWS", 1)
+
+    cursor = _cursor_with_rows([{"id": 1}, {"id": 2}])
+    driver, _ = _driver_with_cursor(cursor)
+
+    await driver.execute_query("SELECT '\x1b[2J\nforged' AS c FROM big_table", force_readonly=True)
+
+    [record] = [r for r in caplog.records if r.name == "postgres_mcp.sql_audit"]
+    message = record.getMessage()
+    assert "truncated at 1 rows" in message
+    assert "\n" not in message
+    assert "\x1b" not in message
 
 
 def test_should_stream_only_single_plain_selects():

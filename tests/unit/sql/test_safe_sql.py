@@ -132,7 +132,7 @@ async def test_select_with_malicious_comment(safe_driver):
     """
     with pytest.raises(
         ValueError,
-        match="Error validating query",
+        match="Multi-statement",
     ):
         await safe_driver.execute_query(query)
 
@@ -195,9 +195,17 @@ async def test_select_with_commit(safe_driver):
     """
     with pytest.raises(
         ValueError,
-        match="Error validating query",
+        match="Multi-statement",
     ):
         await safe_driver.execute_query(query)
+
+    # A lone COMMIT is a single statement, so the statement-type check is its
+    # only line of defense.
+    with pytest.raises(
+        ValueError,
+        match="Error validating query",
+    ):
+        await safe_driver.execute_query("COMMIT")
 
 
 @pytest.mark.asyncio
@@ -244,9 +252,17 @@ async def test_begin_transaction_blocked(safe_driver):
     """
     with pytest.raises(
         ValueError,
-        match="Error validating query",
+        match="Multi-statement",
     ):
         await safe_driver.execute_query(query)
+
+    # A lone BEGIN is a single statement, so the statement-type check is its
+    # only line of defense.
+    with pytest.raises(
+        ValueError,
+        match="Error validating query",
+    ):
+        await safe_driver.execute_query("BEGIN")
 
 
 @pytest.mark.asyncio
@@ -843,6 +859,15 @@ async def test_query_with_whitespace(safe_driver, mock_sql_driver):
     """
     await safe_driver.execute_query(query)
     mock_sql_driver.execute_query.assert_awaited_once_with("/* crystaldba */ " + query, params=None, force_readonly=True)
+
+
+@pytest.mark.asyncio
+async def test_multi_statement_input_is_rejected(safe_driver, mock_sql_driver):
+    """One semicolon must not route around the streamed memory bound: multi-statement input cannot stream, so restricted mode rejects it."""
+    with pytest.raises(ValueError, match="Multi-statement"):
+        await safe_driver.execute_query("SELECT 1 AS a; SELECT 2 AS b")
+
+    mock_sql_driver.execute_query.assert_not_awaited()
 
 
 @pytest.mark.asyncio

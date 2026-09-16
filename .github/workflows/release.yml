@@ -7,6 +7,13 @@
 #   - IAM role for GitHub OIDC, trust policy scoped to repo:sfcompute/postgres-mcp,
 #     with push permissions on the ECR repository sfcompute/postgres-mcp.
 #   - Repo-level Actions variables: ECR_PUSH_ROLE_ARN, AWS_REGION.
+#
+# Each release is also best-effort shadowed into the staging-account registry
+# (TOOL-862) so the staging cluster can pull the same tags; staging failures
+# never block the prod release. Setup: the github-ecr-push-postgres-mcp role
+# in the staging account (terraform/infra-aws/stage/core/ecr.tf in the
+# monorepo) and the STAGING_ECR_PUSH_ROLE_ARN repo variable. Leaving the
+# variable unset skips the shadow steps.
 ---
 name: Release Docker Image to ECR
 
@@ -73,3 +80,49 @@ jobs:
           labels: ${{ steps.docker_meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Staging shadow. Only runs when the prod image was actually published,
+      # and every step is continue-on-error so a staging-side failure never
+      # fails the release.
+      - name: Configure AWS credentials (staging)
+        id: staging-creds
+        if: ${{ (github.event_name == 'push' || inputs.push == true) && vars.STAGING_ECR_PUSH_ROLE_ARN != '' }}
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.STAGING_ECR_PUSH_ROLE_ARN }}
+          # The staging registry's region (terraform/infra-aws/stage/core/locals.tf
+          # in the monorepo), distinct from vars.AWS_REGION (the prod registry's).
+          aws-region: us-west-2
+
+      - name: Login to Amazon ECR (staging)
+        id: staging-ecr-login
+        if: ${{ steps.staging-creds.outcome == 'success' }}
+        continue-on-error: true
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Prepare Docker tags (staging)
+        id: staging_docker_meta
+        if: ${{ steps.staging-ecr-login.outcome == 'success' }}
+        continue-on-error: true
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.staging-ecr-login.outputs.registry }}/sfcompute/postgres-mcp
+          tags: |
+            type=ref,event=tag
+            type=sha,format=long
+
+      - name: Push to staging ECR
+        if: ${{ steps.staging_docker_meta.outcome == 'success' }}
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # Rebuilds entirely from the cache the prod build just wrote, so this
+          # is a re-tag + push, not a second build.
+          push: true
+          tags: ${{ steps.staging_docker_meta.outputs.tags }}
+          labels: ${{ steps.staging_docker_meta.outputs.labels }}
+          cache-from: type=gha

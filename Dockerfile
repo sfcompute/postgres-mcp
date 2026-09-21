@@ -41,8 +41,14 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.vendor="Crystal DBA"
 LABEL org.opencontainers.image.url="https://www.crystaldba.ai"
 
-# Install runtime system dependencies
-RUN apt-get update && apt-get install -y \
+# Install runtime system dependencies. The `upgrade` is what pulls Debian's
+# security point releases (perl, glibc) in: those packages come from the base
+# image and are not in the install list, so `install` alone never touches them
+# and a rebuild only clears their CVEs if Docker Hub happens to have refreshed
+# python:3.12-slim-trixie first.
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+  && apt-get install -y \
   libpq-dev \
   iputils-ping \
   dnsutils \
